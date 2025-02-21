@@ -1,0 +1,253 @@
+/* 
+Adafruit sheild on top of the Arduino Uno R3
+V1 starting with the RTC (Newer Adafruit sheild uses PCF8523 RTC) and SD card only
+V2 added in the first RFID reader and saving it to the SD card with the time
+V3 adding in the further RFID reader, using a single translator worked fine
+V4/5 Removed //this part was causing the error to return to startup
+//  if (! rtc.begin()) {
+//    Serial.println("Couldn't find RTC");
+//    Serial.flush();
+//    while (1) delay(10);
+//  }
+  Wire.begin();  <-- added this in
+  rtc.begin();  <-- swithed from rtc.start()
+V6 adding in the error LED, noticed that it has trouble scanning two tags sitting on the same module, 
+will continually scan the first one that got under it. Consider adding delaytimes in the loops to 
+see if that makes a difference 
+V7 adding in error pin on 7
+V8 cleaning up error pin on 7, adding in hourly reading and saving of thermisor analog value, make sure the resistor is working right
+V11 most up to date version with serial prints still included
+V12 removed one of the RFID readers, plan to use two arduino systems per hive to increase consistancy of reads
+
+Pins A4 and A5 are reserved for the RTC
+Pins 10 (Chipselect), 11, 12, 13 are reserved for the SD card
+Pin A0 and REF are for thermistor
+Pin 2 is for the red LED
+Closer RFID reader pins 5, 6
+Error report pin 7
+
+Testing notes: 
+-removing all time stamps from the void loop while leaving everything else the same, results
+in successful scanning of tags and saving to SD card from both modules. 
+-Keeping time readings to serial monitor but not saving them to SD card for both modules: first module 
+works just fine. second module will read correct time/date but then always crash and go back to void setup
+-Running the code with only one module, RTC, and SD card works as well. 
+-Running the code with both modules saving the tag numbers to the SD card: 
+    Variation  1: the module first in the void loop has code to reads the RTC, and the other does not: results in
+    scanning of second module (without time) fine but has wrong time for first module and either freezes
+    the serial monitor or goes back to void setup if asking it to save time to the SD card. If only reading the time 
+    (without saving) then it just says the incorrect time. 
+    Variation 2: the module first in the void loop does not have code to read the RTC, and the other does: if you 
+    scan the second module first, then it reads the correct time and saves it. However, if you then scan from the first 
+    module, the time from the second is corrupted and no longer scans correctly. Once it is corrupted: if you are saving
+    the time to the SD card in the code then it either crashes serial or sends back to void setup. if not saving the time 
+    to SD card then just displays incorrect time on serial monitor but tag scans are still possible.      
+ 
+*/
+
+#include "RTClib.h"          //RTC
+#include <SPI.h>             //SD
+#include <SD.h>              //SD
+#include <SoftwareSerial.h>  //for the reader
+
+//RTC Adafruit Sheild (pins A4, A5)
+RTC_PCF8523 rtc;
+char t[32];
+
+//global variables
+#define delaytime 250
+
+//SD Card
+const int chipSelect = 10;
+// Create a file to store the data
+File myFile;
+
+//RFID Closer
+byte read_byte_close;
+bool found_close;
+byte data_close[20];
+
+//Specify Arduino pins for Serial connection, closer module:
+//SoftwareSerial UHF(RX_pin, TX_pin);
+SoftwareSerial UHFclose(5, 6);
+
+//Error LED
+#define LED_PIN 2
+
+//output pin for error reporting
+//#define ERROR_REPORT 7
+
+// which analog pin to connect
+#define THERMISTORPIN A0
+
+
+void setup() {
+  Serial.begin(9600);  //baud rate from adafruit datalogger sheild example
+
+
+//trying alternative RTC set up from adafruit example:
+#ifndef ESP8266
+  while (!Serial)
+    ;  // wait for serial port to connect. Needed for native USB
+#endif
+
+  //this part was causing the error to return to startup
+  //  if (! rtc.begin()) {
+  //    Serial.println("Couldn't find RTC");
+  //    Serial.flush();
+  //    while (1) delay(10);
+  //  }
+  Wire.begin();
+  rtc.begin();
+  // (!rtc.initialized() || rtc.lostPower()) {
+    //Serial.println("RTC is NOT initialized, let's set the time!");
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  //}
+
+
+  //SD Card initialization
+  Serial.print("Initializing SD card...");
+
+  // see if the card is present and can be initialized:
+  if (!SD.begin(chipSelect)) {
+    Serial.println("Card failed, or not present");
+    //don't do anything more:
+    while (1);
+  }
+  Serial.println("card initialized.");
+
+  //RFID Reader (Closer)
+  //Software UART interface to FM-504
+  UHFclose.begin(38400);  //Baud rate: 38400 Baud
+  delay(delaytime);
+
+  //Read RFID reader ID
+  Serial.print("Probing closer RFID reader...");
+  //Command to RFID - display reader ID
+  //UHFclose.listen();
+  UHFclose.write(0x0A);  //Reader ID: 0A 53 0D
+  UHFclose.write(0x53);  //          <LF>S<CR>
+  UHFclose.write(0x0D);
+  delay(delaytime);
+  while (UHFclose.available() > 0) {  //checks return bytes in buffer
+    read_byte_close = UHFclose.read();
+    Serial.write(read_byte_close);
+  }
+  Serial.println(" ");
+
+  //LED
+  pinMode(LED_PIN, OUTPUT);
+
+  //Error Report
+  //pinMode(ERROR_REPORT, OUTPUT);
+
+  //reference for the thermistor
+  analogReference(EXTERNAL);
+}
+
+void loop() {
+  //Command to RFID - read bee tag - Query EPC for closer module
+  //UHFclose.listen();
+  UHFclose.write(0x0A);  //Reader ID: 0A 51 0D
+  UHFclose.write(0x51);  //          <LF> Q <CR>
+  UHFclose.write(0x0D);  //EPC: PC + EPC + CRC16
+  delay(delaytime);
+  found_close = false;
+  int size_close = 0;
+  while (UHFclose.available() > 0) {
+    read_byte_close = UHFclose.read();
+    if (read_byte_close != 'Q' && read_byte_close != '\r' && read_byte_close != '\n') {
+      data_close[size_close] = read_byte_close;
+      size_close++;
+      found_close = true;
+    }
+  }
+
+  if (found_close && size_close > 10) {
+    for (int j = 0; j < size_close; j++) {
+      Serial.write(data_close[j]);
+      if (UHFclose.overflow()) {
+        Serial.print("UHF close overflow");
+      }
+    }
+
+    Serial.print(" Closer RFID Read");
+    Serial.print('\n');
+
+
+    // open the file. note that only one file can be open at a time,
+    // so you have to close this one before opening another.
+    myFile = SD.open("datalog.txt", FILE_WRITE);
+
+    // if the file is available, write to it:
+    if (myFile) {
+      Serial.println("File opened ok");
+      for (int n = 0; n < size_close; n++) {
+        myFile.print(data_close[n]);
+      }
+
+      myFile.print(", ");
+      myFile.print("Closer");
+      myFile.print(", ");
+
+      //Saving time to SD card and monitor
+      DateTime now = rtc.now();
+      sprintf(t, "%02d:%02d:%02d %02d/%02d/%02d", now.hour(), now.minute(), now.second(), now.day(), now.month(), now.year());
+      myFile.println(t);
+      Serial.println(t);
+      Serial.println("successfully written on SD card");
+      Serial.print('\n');
+
+      myFile.close();
+
+      digitalWrite(LED_PIN, LOW);
+    }
+
+    // if the file isn't open, pop up an error:
+    else {
+      Serial.println("error datalog.txt");
+      digitalWrite(LED_PIN, HIGH);
+      //to re-initialize SD card if there was an error
+      Serial.print("Initializing SD card...");
+      if (!SD.begin(chipSelect)) {
+        Serial.println("initialization failed!");
+        return;
+      }
+      Serial.println("initialization done.");
+    }
+
+  }
+
+  //taking hourly temperature
+  DateTime now = rtc.now();
+  if (now.hour() == 0 & now.minute() == 0 & now.second() == 0 || now.hour() == 1 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 2 & now.minute() == 0 & now.second() == 0 || now.hour() == 3 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 4 & now.minute() == 0 & now.second() == 0 || now.hour() == 5 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 6 & now.minute() == 0 & now.second() == 0 || now.hour() == 7 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 8 & now.minute() == 0 & now.second() == 0 || now.hour() == 9 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 10 & now.minute() == 0 & now.second() == 0 || now.hour() == 11 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 12 & now.minute() == 0 & now.second() == 0 || now.hour() == 13 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 14 & now.minute() == 0 & now.second() == 0 || now.hour() == 15 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 16 & now.minute() == 0 & now.second() == 0 || now.hour() == 17 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 18 & now.minute() == 0 & now.second() == 0 || now.hour() == 19 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 20 & now.minute() == 0 & now.second() == 0 || now.hour() == 21 & now.minute() == 0 & now.second() == 0
+      || now.hour() == 22 & now.minute() == 0 & now.second() == 0 || now.hour() == 23 & now.minute() == 0 & now.second() == 0) {
+    Serial.print("Analog reading thermistor: ");
+    Serial.println(analogRead(THERMISTORPIN));
+    myFile = SD.open("datalog.txt", FILE_WRITE);
+    //if the file is available, write to it:
+    if (myFile) {
+      Serial.println("File opened ok");
+      myFile.print("Analog reading thermistor: ");
+      myFile.println(analogRead(THERMISTORPIN));
+      myFile.println(", ");
+      sprintf(t, "%02d:%02d:%02d %02d/%02d/%02d", now.hour(), now.minute(), now.second(), now.day(), now.month(), now.year());
+      myFile.println(t);
+    }
+    myFile.close();
+  }
+
+  //digitalWrite(ERROR_REPORT, HIGH);
+  //delay(50);
+  //digitalWrite(ERROR_REPORT, LOW);
+}
